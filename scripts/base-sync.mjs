@@ -54,6 +54,89 @@ const assertSafePaths = (root, paths) => {
   if (bad.length) throw new Error(`unsafe path outside the demo root: ${bad.map((p) => JSON.stringify(p)).join(', ')}`);
 };
 
+// Real-path containment (policy): a path is refused if its real parent directory leaves the real
+// demo root, if any ancestor is a dangling or looping symlink, or if the path itself is a symlink
+// (we never write, delete or read THROUGH a symlinked file, even one pointing inside the root).
+// A symlinked DIRECTORY whose real target stays inside the root is allowed.
+export function symlinkIssue(root, p) {
+  const bad = (why) => `${JSON.stringify(p)} ${why}`;
+  let realRoot;
+  try { realRoot = fs.realpathSync(root); } catch (e) { return bad(`cannot resolve the demo root (${e.code})`); }
+  const full = path.join(root, p);
+  try {
+    if (fs.lstatSync(full).isSymbolicLink()) return bad('is a symlink; base-sync does not write, delete or read through symlinked files');
+  } catch (e) {
+    if (e.code === 'ELOOP') return bad('crosses a symlink loop');
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') return bad(`cannot be inspected (${e.code})`);
+  }
+  let cur = path.dirname(full);
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      const rel = path.relative(realRoot, real);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return bad('resolves through a symlink to outside the demo root');
+      return null;
+    } catch (e) {
+      if (e.code === 'ELOOP') return bad('crosses a symlink loop');
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') return bad(`cannot be resolved (${e.code})`);
+      try { fs.lstatSync(cur); return bad('crosses a dangling symlink'); } catch { /* really absent: go up */ }
+      const up = path.dirname(cur);
+      if (up === cur) return null;
+      cur = up;
+    }
+  }
+}
+const assertContained = (root, p) => {
+  const i = symlinkIssue(root, p);
+  if (i) throw new Error(`refusing path ${i}`);
+};
+// hashFile for demo files: refuses symlink escapes before reading.
+const safeHash = (root, p) => { assertContained(root, p); return hashFile(root, p); };
+
+// ---- lock loading and schema -----------------------------------------------
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+export function lockProblem(lock, { needBase = false } = {}) {
+  const f = (m) => `${LOCK}: ${m}`;
+  if (!isObj(lock)) return f('must be a JSON object');
+  if (lock.base !== undefined || needBase) {
+    if (!isObj(lock.base)) return f('field "base" must be an object');
+    if (needBase && typeof lock.base.repo !== 'string') return f('field "base.repo" must be a string');
+    if (lock.base.version != null && typeof lock.base.version !== 'string') return f('field "base.version" must be a string or null');
+  }
+  if (lock.files !== undefined) {
+    if (!isObj(lock.files)) return f('field "files" must be an object');
+    for (const [k, e] of Object.entries(lock.files)) {
+      if (!isObj(e)) return f(`field "files.${k}" must be an object with sha256 and group`);
+      if (e.sha256 !== null && typeof e.sha256 !== 'string') return f(`field "files.${k}.sha256" must be a string or null`);
+      if (typeof e.group !== 'string') return f(`field "files.${k}.group" must be a string`);
+    }
+  }
+  if (lock.seeded !== undefined) {
+    if (!isObj(lock.seeded)) return f('field "seeded" must be an object');
+    for (const [k, v] of Object.entries(lock.seeded)) if (typeof v !== 'string') return f(`field "seeded.${k}" must be a hash string`);
+  }
+  for (const k of ['demoPaths', 'adopted']) {
+    if (lock[k] !== undefined && (!Array.isArray(lock[k]) || lock[k].some((x) => typeof x !== 'string'))) return f(`field "${k}" must be an array of strings`);
+  }
+  if (lock.overrides !== undefined) {
+    if (!Array.isArray(lock.overrides)) return f('field "overrides" must be an array');
+    const i = lock.overrides.findIndex((o) => !isObj(o));
+    if (i >= 0) return f(`field "overrides[${i}]" must be an object`);
+  }
+  return null;
+}
+// Returns { lock } or { error } (one clean line); never throws on a bad or hostile lock.
+export function loadLock(root, opts) {
+  const issue = symlinkIssue(root, LOCK);
+  if (issue) return { error: `${LOCK}: refusing path ${issue}` };
+  let lock;
+  try { lock = JSON.parse(fs.readFileSync(path.join(root, LOCK), 'utf8')); } catch (e) {
+    return { error: `${LOCK}: ${e instanceof SyntaxError ? `not valid JSON (${e.message})` : `cannot be read (${e.code || e.message})`}` };
+  }
+  const error = lockProblem(lock, opts);
+  return error ? { error } : { lock };
+}
+
 // ---- globs -----------------------------------------------------------------
 export function globToRegExp(glob) {
   let g = glob.endsWith('/') ? `${glob}**` : glob;
@@ -153,11 +236,17 @@ export function depProblems(root) {
 export function check(root, { now = today() } = {}) {
   const lockFile = path.join(root, LOCK);
   if (!fs.existsSync(lockFile)) return { ok: false, problems: [{ path: LOCK, kind: 'no-lock', msg: 'no lock file; run --init' }], pending: [] };
-  const lock = readJson(lockFile);
+  const loaded = loadLock(root);
+  if (loaded.error) return { ok: false, problems: [{ path: LOCK, kind: 'bad-lock', msg: loaded.error }], pending: [] };
+  const lock = loaded.lock;
   const problems = [...overrideProblems(lock, now)];
   const pending = [];
   for (const p of [...Object.keys(lock.files || {}), ...Object.keys(lock.seeded || {})]) {
     if (unsafePath(p, root)) problems.push({ path: p, kind: 'unsafe-path', msg: 'lock path is absolute or outside the demo root' });
+  }
+  for (const p of Object.keys(lock.files || {})) {
+    const i = unsafePath(p, root) ? null : symlinkIssue(root, p);
+    if (i) problems.push({ path: p, kind: 'unsafe-path', msg: `refusing path ${i}` });
   }
   if (problems.some((x) => x.kind === 'unsafe-path')) return { ok: false, problems, pending };
   for (const [p, e] of Object.entries(lock.files || {})) {
@@ -185,7 +274,7 @@ export function plan({ root, lock, manifest, baseDir, includeWorkflows = false, 
   const content = (p) => fs.readFileSync(path.join(baseDir, p));
   for (const row of manifest) {
     const p = row.path;
-    const L = hashFile(root, p);
+    const L = safeHash(root, p);
     if (row.seeded) {
       if (L === null) { out.writes.push({ path: p, data: content(p) }); out.seeded[p] = row.sha256; } else out.seeded[p] = lock.seeded?.[p] ?? L;
       continue;
@@ -211,7 +300,7 @@ export function plan({ root, lock, manifest, baseDir, includeWorkflows = false, 
   for (const [p, e] of Object.entries(lock.files || {})) {
     if (rows.has(p)) continue;
     if (!isAdopted(lock, e.group)) continue; // pending rows vanish quietly
-    if (acceptRemoval.includes(p)) { if (hashFile(root, p) === e.sha256) out.deletes.push(p); } else out.removals.push(p);
+    if (acceptRemoval.includes(p)) { if (safeHash(root, p) === e.sha256) out.deletes.push(p); } else out.removals.push(p);
   }
   return out;
 }
@@ -263,11 +352,42 @@ export function runSelftest(baseDir) {
 }
 
 // ---- --init / --update -----------------------------------------------------
-function applyPlan(root, lock, pl, baseInfo, repo, tag) {
-  for (const w of pl.writes) writeAtomic(path.join(root, w.path), w.data);
-  for (const p of pl.deletes) fs.rmSync(path.join(root, p), { force: true });
+const defaultIo = { writeFile: fs.writeFileSync, rename: fs.renameSync, rm: (f) => fs.rmSync(f, { force: true }) };
+const readOrNull = (f) => { try { return fs.readFileSync(f); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+
+// Stage every write (and the lock) as a temp file next to its target; only when all temps exist
+// rename them in one pass, lock last. Any failure removes the temps, restores what was renamed or
+// deleted, and removes directories this call created, leaving the tree as it was.
+export function applyPlan(root, lock, pl, baseInfo, repo, tag, io = defaultIo) {
   const next = { ...lock, base: { repo, version: tag, commit: baseInfo.commit }, files: Object.fromEntries(Object.entries(pl.files).sort()), seeded: pl.seeded };
-  writeJson(path.join(root, LOCK), next);
+  const ops = [...pl.writes.map((w) => ({ p: w.path, data: w.data })), { p: LOCK, data: JSON.stringify(next, null, 2) + '\n' }];
+  for (const p of [...ops.map((o) => o.p), ...pl.deletes]) assertContained(root, p);
+  const temps = [];
+  const createdDirs = [];
+  const done = []; // { file, orig } for renamed targets and deleted files
+  try {
+    ops.forEach((o, i) => {
+      o.file = path.join(root, o.p);
+      const made = fs.mkdirSync(path.dirname(o.file), { recursive: true });
+      if (made) createdDirs.push(made);
+      o.tmp = `${o.file}.tmp-${process.pid}-${i}`;
+      temps.push(o.tmp);
+      io.writeFile(o.tmp, o.data);
+    });
+    const lockOp = ops.pop();
+    for (const o of [...ops, ...pl.deletes.map((p) => ({ del: path.join(root, p) })), lockOp]) {
+      const file = o.del || o.file;
+      done.push({ file, orig: readOrNull(file) });
+      if (o.del) io.rm(file); else io.rename(o.tmp, file);
+    }
+  } catch (e) {
+    for (const t of temps) fs.rmSync(t, { force: true });
+    for (const { file, orig } of done.reverse()) {
+      if (orig === null) fs.rmSync(file, { force: true }); else fs.writeFileSync(file, orig);
+    }
+    for (const d of createdDirs.reverse()) fs.rmSync(d, { recursive: true, force: true });
+    throw e;
+  }
   return next;
 }
 
@@ -281,7 +401,9 @@ export function sync({ root, mode, repo, tag, adopt, demoPaths, includeWorkflows
     if (adopt) lock.adopted = adopt;
   } else {
     if (!fs.existsSync(lockFile)) return { code: 1, lines: [`no ${LOCK}; run --init`] };
-    lock = readJson(lockFile);
+    const loaded = loadLock(root, { needBase: true });
+    if (loaded.error) return { code: 1, lines: [loaded.error] };
+    lock = loaded.lock;
     repo = repo || lock.base.repo;
     if (adopt) lock.adopted = [...new Set([...(lock.adopted || []), ...adopt])];
   }
@@ -300,6 +422,12 @@ export function sync({ root, mode, repo, tag, adopt, demoPaths, includeWorkflows
     } catch (e) {
       return { code: 1, lines: [`aborted, nothing changed: ${e.message}`] };
     }
+    try {
+      assertContained(root, LOCK);
+      for (const c of pl.conflicts) assertContained(root, `${c.path}.base-new`);
+    } catch (e) {
+      return { code: 1, lines: [`aborted, nothing changed: ${e.message}`] };
+    }
     for (const c of pl.conflicts) {
       writeAtomic(path.join(root, `${c.path}.base-new`), c.data);
       lines.push(`conflict: ${c.path} (base version written to ${c.path}.base-new)`);
@@ -309,7 +437,11 @@ export function sync({ root, mode, repo, tag, adopt, demoPaths, includeWorkflows
       lines.push('stopped, nothing else changed');
       return { code: 1, lines };
     }
-    applyPlan(root, lock, pl, info, repo, tag);
+    try {
+      applyPlan(root, lock, pl, info, repo, tag);
+    } catch (e) {
+      return { code: 1, lines: [`aborted, nothing changed: ${e.message}`] };
+    }
     for (const p of pl.localOnly) lines.push(`kept locally edited file: ${p} (--check will fail until reverted or overridden)`);
     for (const p of pl.overrideKept) lines.push(`kept by override: ${p}`);
     if (pl.skippedWorkflows.length) lines.push(`workflow files NOT written (apply locally with --update --include-workflows): ${pl.skippedWorkflows.join(', ')}`);
@@ -323,7 +455,9 @@ export function sync({ root, mode, repo, tag, adopt, demoPaths, includeWorkflows
 }
 
 export function remoteCheck(root, env = process.env) {
-  const lock = readJson(path.join(root, LOCK));
+  const loaded = loadLock(root, { needBase: true });
+  if (loaded.error) return { code: 1, lines: [loaded.error] };
+  const lock = loaded.lock;
   const latest = latestTag(lock.base.repo, env);
   const behind = cmpVer(latest, lock.base.version) > 0;
   return { code: 0, lines: [behind ? `base ${latest} is available (you are on ${lock.base.version})` : `up to date at ${lock.base.version}`] };

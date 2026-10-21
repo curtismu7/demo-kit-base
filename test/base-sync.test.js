@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  LOCK, sha, unsafePath, classify3, globToRegExp, check, sync, release, latestTag, remoteCheck, main, parseArgs, selftest,
+  LOCK, sha, unsafePath, applyPlan, symlinkIssue, classify3, globToRegExp, check, sync, release, latestTag, remoteCheck, main, parseArgs, selftest,
 } from '../scripts/base-sync.mjs';
 
 const REAL_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts/base-sync.mjs');
@@ -463,5 +463,225 @@ describe('path containment', () => {
     assert.equal(r.code, 1);
     assert.equal(fs.readFileSync(outside, 'utf8'), 'keep');
     fs.rmSync(outside);
+  });
+});
+
+const snapshot = (root) => {
+  const out = {};
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const f = path.join(dir, e.name); const rel = path.relative(root, f);
+      if (e.isSymbolicLink()) out[rel] = `link:${fs.readlinkSync(f)}`;
+      else if (e.isDirectory()) { out[rel] = 'dir'; walk(f); } else out[rel] = fs.readFileSync(f).toString('hex');
+    }
+  })(root);
+  return out;
+};
+
+describe('symlink containment (real-path)', () => {
+  // Policy: directory symlinks whose real target stays inside the demo root are allowed; any path
+  // that resolves outside, crosses a loop or dangling link, or is itself a symlink is refused.
+  const outsideDir = (files = {}) => { const d = tmp(); for (const [k, v] of Object.entries(files)) put(d, k, v); return d; };
+  const bareDemo = () => { const d = tmp(); put(d, 'demo/demo.json', '{}'); return d; };
+  const refused = (r, re) => { assert.equal(r.code, 1, r.lines.join('\n')); assert.match(r.lines.join('\n'), re); };
+
+  test('directory symlink escaping the root: init refuses, writes nothing outside', () => {
+    const base = makeBase(V1); const out = outsideDir(); const demo = bareDemo();
+    fs.symlinkSync(out, path.join(demo, 'lib'));
+    const r = sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' });
+    refused(r, /lib\/a\.js.*outside the demo root/);
+    assert.deepEqual(fs.readdirSync(out), []);
+    assert.equal(fs.existsSync(path.join(demo, LOCK)), false);
+  });
+  test('relative symlink using ../ that resolves outside after realpath is refused', () => {
+    const base = makeBase(V1); const outer = tmp(); const demo = path.join(outer, 'demo');
+    put(demo, 'demo/demo.json', '{}');
+    fs.symlinkSync('..', path.join(demo, 'lib'));
+    refused(sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' }), /outside the demo root/);
+    assert.deepEqual(fs.readdirSync(outer), ['demo']);
+  });
+  test('update through a symlinked directory is refused and the outside copy is untouched', () => {
+    const base = makeBase(V1); const demo = initDemo(base);
+    const out = outsideDir({ 'a.js': 'a1', 'b.js': 'b1' });
+    fs.rmSync(path.join(demo, 'lib'), { recursive: true }); fs.symlinkSync(out, path.join(demo, 'lib'));
+    publish(base, V2, 'v1.1.0');
+    refused(sync({ root: demo, mode: 'update' }), /outside the demo root/);
+    assert.equal(fs.readFileSync(path.join(out, 'a.js'), 'utf8'), 'a1');
+    assert.equal(JSON.parse(get(demo, LOCK)).base.version, 'v1.0.0');
+  });
+  test('a symlinked file is not written through, even when it points inside the root', () => {
+    const base = makeBase(V1); const demo = initDemo(base);
+    publish(base, V2, 'v1.1.0');
+    const victim = path.join(tmp(), 'victim'); fs.writeFileSync(victim, 'a1');
+    fs.rmSync(path.join(demo, 'lib/a.js')); fs.symlinkSync(victim, path.join(demo, 'lib/a.js'));
+    refused(sync({ root: demo, mode: 'update' }), /lib\/a\.js.*symlink/);
+    assert.equal(fs.readFileSync(victim, 'utf8'), 'a1');
+    put(demo, 'inside.txt', 'x');
+    fs.rmSync(path.join(demo, 'lib/a.js')); fs.symlinkSync(path.join(demo, 'inside.txt'), path.join(demo, 'lib/a.js'));
+    refused(sync({ root: demo, mode: 'update' }), /lib\/a\.js.*symlink/);
+    assert.equal(get(demo, 'inside.txt'), 'x');
+  });
+  test('symlink loop is refused with a clean message', () => {
+    const base = makeBase(V1); const demo = bareDemo();
+    fs.symlinkSync('loop2', path.join(demo, 'lib')); fs.symlinkSync('lib', path.join(demo, 'loop2'));
+    refused(sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' }), /loop/);
+    assert.equal(fs.existsSync(path.join(demo, LOCK)), false);
+  });
+  test('dangling directory symlink is refused', () => {
+    const base = makeBase(V1); const demo = bareDemo();
+    fs.symlinkSync(path.join(tmp(), 'gone'), path.join(demo, 'lib'));
+    refused(sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' }), /dangling/);
+  });
+  test('directory symlink that stays inside the root is allowed', () => {
+    const base = makeBase(V1); const demo = bareDemo();
+    fs.mkdirSync(path.join(demo, 'demo/real-lib')); fs.symlinkSync('demo/real-lib', path.join(demo, 'lib'));
+    const r = sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' });
+    assert.equal(r.code, 0, r.lines.join('\n'));
+    assert.equal(get(demo, 'demo/real-lib/a.js'), 'a1');
+  });
+  test('delete through an escaping symlink is refused (--accept-removal)', () => {
+    const base = makeBase(V1); const demo = initDemo(base);
+    publish(base, { files: { 'lib/a.js': V1.files['lib/a.js'], 'README.md': V1.files['README.md'] } }, 'v1.1.0');
+    const out = outsideDir({ 'a.js': 'a1', 'b.js': 'b1' });
+    fs.rmSync(path.join(demo, 'lib'), { recursive: true }); fs.symlinkSync(out, path.join(demo, 'lib'));
+    refused(sync({ root: demo, mode: 'update', acceptRemoval: ['lib/b.js'] }), /outside the demo root/);
+    assert.equal(fs.readFileSync(path.join(out, 'b.js'), 'utf8'), 'b1');
+  });
+  test('check refuses a lock reached through a symlink and a lock key behind an escaping symlink', () => {
+    const base = makeBase(V1); const demo = initDemo(base);
+    const out = outsideDir({ 'a.js': 'a1', 'b.js': 'b1' });
+    fs.rmSync(path.join(demo, 'lib'), { recursive: true }); fs.symlinkSync(out, path.join(demo, 'lib'));
+    assert.ok(kinds(check(demo)).includes('unsafe-path:lib/a.js'));
+    const lockText = get(demo, LOCK); const real = path.join(out, 'lock.json');
+    fs.writeFileSync(real, lockText); fs.rmSync(path.join(demo, LOCK)); fs.symlinkSync(real, path.join(demo, LOCK));
+    const r = check(demo);
+    assert.deepEqual(kinds(r), [`bad-lock:${LOCK}`]);
+    assert.match(r.problems[0].msg, /symlink/);
+    refused(sync({ root: demo, mode: 'update' }), /symlink/);
+  });
+  test('symlinkIssue: ordinary and not-yet-existing paths are clean', () => {
+    const d = tmp(); put(d, 'x/y.txt', '1');
+    assert.equal(symlinkIssue(d, 'x/y.txt'), null);
+    assert.equal(symlinkIssue(d, 'new/deep/z.txt'), null);
+  });
+});
+
+describe('lock schema', () => {
+  const withLock = (text) => { const d = tmp(); put(d, LOCK, text); return d; };
+  test('null lock entry gives one clean problem line naming file and field', () => {
+    const r = check(withLock('{"files":{"x":null}}'));
+    assert.equal(r.ok, false); assert.equal(r.problems.length, 1);
+    assert.match(r.problems[0].msg, new RegExp(`${LOCK.replace('.', '\\.')}: field "files\\.x" must be an object`));
+  });
+  test('malformed JSON, non-object lock, null override and bad fields each give one clean line', () => {
+    for (const [text, re] of [['{nope', /not valid JSON/], ['[]', /must be a JSON object/], ['null', /must be a JSON object/],
+      ['{"overrides":[null]}', /overrides\[0\]/], ['{"files":{"x":{"sha256":5,"group":"G"}}}', /files\.x\.sha256/],
+      ['{"files":{"x":{"sha256":null}}}', /files\.x\.group/], ['{"seeded":{"s":1}}', /seeded\.s/], ['{"demoPaths":"a"}', /demoPaths/]]) {
+      const r = check(withLock(text));
+      assert.equal(r.problems.length, 1, text); assert.match(r.problems[0].msg, re, text); assert.equal(r.problems[0].kind, 'bad-lock');
+    }
+  });
+  test('CLI --check on a null entry: exit 1, clean line, no TypeError, no stack', () => {
+    const d = withLock('{"files":{"x":null}}');
+    const r = spawnSync(process.execPath, [REAL_SCRIPT, '--check', '--root', d], { encoding: 'utf8' });
+    assert.equal(r.status, 1);
+    assert.doesNotMatch(r.stdout + r.stderr, /TypeError|at .*\.mjs/);
+    assert.match(r.stdout, /bad-lock: demo-kit\.lock\.json: .*files\.x/);
+    assert.equal(r.stderr, '');
+  });
+  test('--update on a malformed or incomplete lock: exit 1, one line, nothing changed', () => {
+    for (const text of ['{nope', '{"files":{"x":null}}', '{"files":{}}']) {
+      const d = withLock(text); const before = snapshot(d);
+      const r = sync({ root: d, mode: 'update' });
+      assert.equal(r.code, 1); assert.equal(r.lines.length, 1); assert.match(r.lines[0], new RegExp(`^${LOCK.replace('.', '\\.')}: `));
+      assert.deepEqual(snapshot(d), before);
+    }
+    assert.equal(remoteCheck(withLock('{nope')).code, 1);
+  });
+});
+
+describe('override expiry (injected clock)', () => {
+  const NOW = '2026-10-21';
+  const setup = (expires) => {
+    const base = makeBase(V1); const demo = initDemo(base);
+    put(demo, 'lib/a.js', 'patched');
+    const lock = JSON.parse(get(demo, LOCK));
+    lock.overrides = [{ path: 'lib/a.js', hash: sha('patched'), reason: 'r', issue: '#9', expires }];
+    put(demo, LOCK, JSON.stringify(lock));
+    publish(base, V2, 'v1.1.0');
+    return demo;
+  };
+  test('expired override: --check rejects it and --update raises a conflict instead of keeping the file', () => {
+    const demo = setup('2026-10-20');
+    assert.deepEqual(kinds(check(demo, { now: NOW })), ['modified:lib/a.js', 'override-expired:lib/a.js']);
+    const r = sync({ root: demo, mode: 'update', now: NOW });
+    assert.equal(r.code, 1, r.lines.join('\n'));
+    assert.match(r.lines.join('\n'), /conflict: lib\/a\.js/);
+    assert.equal(get(demo, 'lib/a.js.base-new'), 'a2');
+    assert.equal(get(demo, 'lib/a.js'), 'patched');
+    assert.equal(JSON.parse(get(demo, LOCK)).base.version, 'v1.0.0');
+  });
+  test('override expiring today is still valid for --check and --update', () => {
+    const demo = setup(NOW);
+    assert.ok(check(demo, { now: NOW }).ok);
+    const r = sync({ root: demo, mode: 'update', now: NOW });
+    assert.equal(r.code, 0, r.lines.join('\n'));
+    assert.match(r.lines.join('\n'), /kept by override: lib\/a\.js/);
+    assert.equal(get(demo, 'lib/a.js'), 'patched');
+  });
+  test('override at the 30-day limit is valid; 31 days is rejected by --check', () => {
+    assert.ok(check(setup('2026-11-20'), { now: NOW }).ok);
+    const far = setup('2026-11-21');
+    assert.ok(kinds(check(far, { now: NOW })).includes('override-invalid:lib/a.js'));
+  });
+  test('override valid for the injected clock but expired a day later', () => {
+    const demo = setup('2026-10-22');
+    assert.ok(check(demo, { now: '2026-10-22' }).ok);
+    assert.ok(kinds(check(demo, { now: '2026-10-23' })).includes('override-expired:lib/a.js'));
+  });
+});
+
+describe('atomic apply (fault injection)', () => {
+  const fixture = () => {
+    const demo = initDemo(makeBase(V1));
+    const lock = JSON.parse(get(demo, LOCK));
+    const pl = {
+      writes: [{ path: 'lib/a.js', data: Buffer.from('NEW-A') }, { path: 'fresh/dir/c.js', data: Buffer.from('NEW-C') }],
+      deletes: ['lib/b.js'],
+      files: { 'lib/a.js': { sha256: sha('NEW-A'), group: 'G1' } },
+      seeded: {},
+    };
+    return { demo, lock, pl, info: { commit: 'deadbeef' } };
+  };
+  const io = (over) => ({ writeFile: fs.writeFileSync, rename: fs.renameSync, rm: (f) => fs.rmSync(f, { force: true }), ...over });
+  const nth = (n, fn, real) => { let i = 0; return (...a) => { if (++i === n) throw new Error('injected fault'); return real(...a); }; };
+
+  test('a temp write that throws midway leaves the tree byte-identical', () => {
+    const { demo, lock, pl, info } = fixture(); const before = snapshot(demo);
+    assert.throws(() => applyPlan(demo, lock, pl, info, 'r', 'v9.9.9', io({ writeFile: nth(2, null, fs.writeFileSync) })), /injected fault/);
+    assert.deepEqual(snapshot(demo), before);
+  });
+  test('a failing lock temp write also leaves the tree byte-identical', () => {
+    const { demo, lock, pl, info } = fixture(); const before = snapshot(demo);
+    assert.throws(() => applyPlan(demo, lock, pl, info, 'r', 'v9.9.9', io({ writeFile: nth(3, null, fs.writeFileSync) })), /injected fault/);
+    assert.deepEqual(snapshot(demo), before);
+  });
+  test('a rename failing on the last (lock) rename is rolled back, temps and new dirs removed', () => {
+    const { demo, lock, pl, info } = fixture(); const before = snapshot(demo);
+    assert.throws(() => applyPlan(demo, lock, pl, info, 'r', 'v9.9.9', io({ rename: nth(3, null, fs.renameSync) })), /injected fault/);
+    assert.deepEqual(snapshot(demo), before);
+  });
+  test('a failing delete is rolled back', () => {
+    const { demo, lock, pl, info } = fixture(); const before = snapshot(demo);
+    assert.throws(() => applyPlan(demo, lock, pl, info, 'r', 'v9.9.9', io({ rm: () => { throw new Error('injected fault'); } })), /injected fault/);
+    assert.deepEqual(snapshot(demo), before);
+  });
+  test('the success path applies everything and leaves no temp files', () => {
+    const { demo, lock, pl, info } = fixture();
+    applyPlan(demo, lock, pl, info, 'r', 'v9.9.9');
+    assert.equal(get(demo, 'lib/a.js'), 'NEW-A'); assert.equal(get(demo, 'fresh/dir/c.js'), 'NEW-C');
+    assert.equal(fs.existsSync(path.join(demo, 'lib/b.js')), false);
+    assert.equal(JSON.parse(get(demo, LOCK)).base.version, 'v9.9.9');
+    assert.deepEqual(Object.keys(snapshot(demo)).filter((k) => k.includes('.tmp-')), []);
   });
 });
