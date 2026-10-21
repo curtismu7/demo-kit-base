@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  LOCK, sha, classify3, globToRegExp, check, sync, release, latestTag, remoteCheck, main, parseArgs, selftest,
+  LOCK, sha, unsafePath, classify3, globToRegExp, check, sync, release, latestTag, remoteCheck, main, parseArgs, selftest,
 } from '../scripts/base-sync.mjs';
 
 const REAL_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts/base-sync.mjs');
@@ -420,5 +420,48 @@ describe('cli and selftest', () => {
   test('selftest passes and the CLI --selftest exits 0', () => {
     assert.equal(selftest(), true);
     assert.equal(spawnSync(process.execPath, [REAL_SCRIPT, '--selftest']).status, 0);
+  });
+});
+
+describe('path containment', () => {
+  test('unsafePath rejects absolute, dotdot and escaping paths', () => {
+    const root = path.join(os.tmpdir(), 'x');
+    for (const p of ['../a', 'a/../../b', '/etc/passwd', 'C:\\x', 'a\\b', '', '.', 'a/..']) assert.equal(unsafePath(p, root), true, p);
+    for (const p of ['a', 'lib/a.js', '.git-ish/x', '.github/workflows/ci.yml']) assert.equal(unsafePath(p, root), false, p);
+  });
+  test('init refuses a poisoned manifest row and writes nothing outside the demo', () => {
+    const outer = tmp();
+    const base = path.join(outer, 'base');
+    fs.mkdirSync(base); git(base, 'init', '-q', '-b', 'main');
+    publish(base, V1, 'v1.0.0');
+    put(base, 'ESCAPE.txt', 'pwn');
+    const rows = JSON.parse(get(base, 'base/manifest.json'));
+    rows.push({ path: '../base/ESCAPE.txt', sha256: sha('pwn'), group: 'G1' });
+    put(base, 'base/manifest.json', JSON.stringify(rows));
+    git(base, 'add', '-A'); git(base, 'commit', '-q', '-m', 'poison'); git(base, 'tag', '-f', 'v1.0.0');
+    const demo = path.join(outer, 'demo');
+    put(demo, 'demo/demo.json', '{}');
+    const before = get(base, 'ESCAPE.txt');
+    const r = sync({ root: demo, mode: 'init', repo: base, tag: 'v1.0.0' });
+    assert.equal(r.code, 1);
+    assert.match(r.lines.join('\n'), /unsafe path/);
+    assert.equal(get(base, 'ESCAPE.txt'), before);
+    assert.equal(fs.existsSync(path.join(demo, LOCK)), false);
+    assert.equal(fs.existsSync(path.join(demo, 'lib/a.js')), false);
+  });
+  test('check flags an escaping lock key and --accept-removal cannot delete it', () => {
+    const base = makeBase(V1);
+    const demo = initDemo(base);
+    const outside = path.join(path.dirname(demo), 'outside-' + path.basename(demo));
+    fs.writeFileSync(outside, 'keep');
+    const lock = JSON.parse(get(demo, LOCK));
+    const rel = '../' + path.basename(outside);
+    lock.files[rel] = { sha256: sha('keep'), group: 'G1' };
+    put(demo, LOCK, JSON.stringify(lock));
+    assert.deepEqual(kinds(check(demo)), [`unsafe-path:${rel}`]);
+    const r = sync({ root: demo, mode: 'update', tag: 'v1.0.0', acceptRemoval: [rel] });
+    assert.equal(r.code, 1);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'keep');
+    fs.rmSync(outside);
   });
 });

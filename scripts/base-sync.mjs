@@ -42,6 +42,18 @@ function writeAtomic(file, data) {
 
 const writeJson = (file, obj) => writeAtomic(file, JSON.stringify(obj, null, 2) + '\n');
 
+// A manifest or lock path must stay inside the demo root: relative, no '..', no backslash or NUL.
+export function unsafePath(p, root) {
+  if (typeof p !== 'string' || !p || p.includes('\0') || p.includes('\\') || path.posix.isAbsolute(p) || path.win32.isAbsolute(p)) return true;
+  if (p.split('/').includes('..')) return true;
+  const rel = path.relative(path.resolve(root), path.resolve(root, p));
+  return !rel || rel.startsWith('..') || path.isAbsolute(rel);
+}
+const assertSafePaths = (root, paths) => {
+  const bad = paths.filter((p) => unsafePath(p, root));
+  if (bad.length) throw new Error(`unsafe path outside the demo root: ${bad.map((p) => JSON.stringify(p)).join(', ')}`);
+};
+
 // ---- globs -----------------------------------------------------------------
 export function globToRegExp(glob) {
   let g = glob.endsWith('/') ? `${glob}**` : glob;
@@ -144,6 +156,10 @@ export function check(root, { now = today() } = {}) {
   const lock = readJson(lockFile);
   const problems = [...overrideProblems(lock, now)];
   const pending = [];
+  for (const p of [...Object.keys(lock.files || {}), ...Object.keys(lock.seeded || {})]) {
+    if (unsafePath(p, root)) problems.push({ path: p, kind: 'unsafe-path', msg: 'lock path is absolute or outside the demo root' });
+  }
+  if (problems.some((x) => x.kind === 'unsafe-path')) return { ok: false, problems, pending };
   for (const [p, e] of Object.entries(lock.files || {})) {
     if (!isAdopted(lock, e.group)) { pending.push(p); continue; }
     const L = hashFile(root, p);
@@ -163,6 +179,7 @@ export function check(root, { now = today() } = {}) {
 
 // ---- planning --------------------------------------------------------------
 export function plan({ root, lock, manifest, baseDir, includeWorkflows = false, acceptRemoval = [], now = today() }) {
+  assertSafePaths(root, [...manifest.map((r) => r.path), ...Object.keys(lock.files || {}), ...Object.keys(lock.seeded || {})]);
   const out = { writes: [], deletes: [], conflicts: [], removals: [], localOnly: [], skippedWorkflows: [], overrideKept: [], seeded: {}, files: {} };
   const rows = new Map(manifest.map((r) => [r.path, r]));
   const content = (p) => fs.readFileSync(path.join(baseDir, p));
@@ -276,7 +293,13 @@ export function sync({ root, mode, repo, tag, adopt, demoPaths, includeWorkflows
   try {
     const st = runSelftest(info.dir);
     if (!st.ok) return { code: 1, lines: [`aborted, nothing changed: ${st.msg}`] };
-    const pl = plan({ root, lock, manifest: info.manifest, baseDir: info.dir, includeWorkflows, acceptRemoval, now });
+    let pl;
+    try {
+      pl = plan({ root, lock, manifest: info.manifest, baseDir: info.dir, includeWorkflows, acceptRemoval, now });
+      assertSafePaths(root, acceptRemoval);
+    } catch (e) {
+      return { code: 1, lines: [`aborted, nothing changed: ${e.message}`] };
+    }
     for (const c of pl.conflicts) {
       writeAtomic(path.join(root, `${c.path}.base-new`), c.data);
       lines.push(`conflict: ${c.path} (base version written to ${c.path}.base-new)`);
