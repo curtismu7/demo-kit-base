@@ -33,3 +33,11 @@ Other rules: any file in no manifest row, seeded list, `demoPaths` or `demo/` fa
 Path safety: besides rejecting absolute and `..` paths, every write, delete and read of a demo file or the lock is checked by real path. A path is refused (exit 1, message names the path, nothing changed) if its real parent directory leaves the real demo root, if it crosses a symlink loop or dangling symlink, or if it is itself a symlink (base-sync never writes, deletes or reads through a symlinked file, even one pointing inside the root). A symlinked directory whose real target stays inside the demo root is allowed. A malformed lock (bad JSON, a null or mistyped field) is reported as one problem line naming `demo-kit.lock.json` and the field, exit 1. `--update` and `--init` stage all writes and the lock as temp files, rename them in one pass (lock last) and roll back on any failure.
 
 The lock is unsigned in v0.1: a hand-edited lock whose hashes are changed to match edited files passes `--check`, and `--update` accepts it. Treat the lock as reviewed content in the demo repo, not as a trust anchor.
+
+## conformance gate
+
+    node scripts/conformance.mjs [dir] [--tier=Demo|Tester|Tool] [--new] [--json]
+
+Checks a demo repo against `STANDALONE-RULES.md` by files and grep: tier line in the README, `CLAUDE.md`, `ci.yml` with gitleaks and the forbidden-strings gate, a portable shelf entry, `demo-health/1`, content pack, doctor, reset, netguard, ReactFlow without mermaid, `127.0.0.1`-only Docker ports, no EC `generateKeyPair`, and for Demos a talk track, presenter mode, `customer.config`, workspace id and `{{cast}}` stories. Which checks apply depends on the tier (the README's `Tier:` line, or `--tier`); with no tier only the all-tier checks run.
+
+Rules 17 (diagram-studio data) and 18 (k8s manifests and a `MODE` switch) are advisory: they print `WARN` for existing apps and become failures with `--new`, which is how a brand-new app's CI should call it. Exit 1 on any failure, 2 on bad arguments. The check is heuristic: a `FAIL` means an artifact is missing, a `PASS` does not prove the app is good. Add it to a demo's CI as `node scripts/conformance.mjs .` (new apps: `--new`) once base-sync delivers the script.

@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    # Set the RUNS_ON repository variable (a JSON array) to change the runner.
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '["self-hosted","macOS"]') }}
+    strategy:
+      matrix:
+        # PRs test the newest Node only; main tests both supported versions.
+        node: ${{ github.event_name == 'pull_request' && fromJSON('[22]') || fromJSON('[20, 22]') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+  secrets:
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '["self-hosted","macOS"]') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: PATH="/opt/homebrew/bin:$PATH" gitleaks detect --source . --redact -v
+      - name: forbidden strings (history)
+        run: |
+          list="$HOME/.config/demo-kit/forbidden-strings.txt"
+          if [ ! -f "$list" ]; then echo "forbidden-strings.txt missing on this runner"; exit 1; fi
+          hits=$(git log -p --all | grep -cF -f "$list" || true)
+          echo "forbidden-string hits: $hits"
+          [ "$hits" = "0" ]
