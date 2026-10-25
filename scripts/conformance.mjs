@@ -78,7 +78,7 @@ export function audit(root, { tier, strictNew = false } = {}) {
   add('keygen', 'no EC generateKeyPair(Sync) (SIGABRT on Node 20)', !/generateKeyPair(Sync)?\(\s*['"]ec['"]/.test(allCode), { tiers: 'A' });
   add(17, 'diagrams from diagram-studio data', /diagram-studio/i.test(srcCode + pkgs), { tiers: 'DT', advisory: true });
   add(18, 'k8s manifests (k8s/ or deploy/k8s)', has('k8s') || has('deploy/k8s'), { tiers: 'A', advisory: true });
-  add(18, 'MODE switch for the mock-only build', /process\.env\.(APP_|DEMO_|HOSTED_)?MODE\b/.test(srcCode), { tiers: 'A', advisory: true });
+  add(18, 'MODE switch for the mock-only build', /\b(process\.)?env\.(APP_|DEMO_|HOSTED_|MOCKAZ_|P1AZ_)?MODE\b/.test(srcCode), { tiers: 'A', advisory: true });
 
   const applies = (c) => !t ? c.tiers === 'A' : c.tiers === 'A' || (c.tiers === 'D' && t === 'Demo') || (c.tiers === 'DT' && t !== 'Tool');
   const rows = C.filter(applies).map((c) => ({ ...c, level: c.ok ? 'pass' : (c.advisory && !strictNew ? 'warn' : 'fail') }));
