@@ -2,7 +2,7 @@
 
 The shared base for the demo family. Demo repos pull base-owned files from tagged releases of this repo with `scripts/base-sync.mjs`. This is the local v0.1 slice (step B1 of the base design): the sync tool and its tests. The base files themselves, CI and the GitHub repo come in later steps. Nothing here has a remote.
 
-Node 20 or newer, no dependencies, tests use `node:test`.
+Node 26 or newer, no dependencies, tests use `node:test`.
 
     npm test
 
