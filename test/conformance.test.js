@@ -37,12 +37,18 @@ test('a compliant Tester passes every required check; rules 17 and 18 only warn'
   assert.equal(rule(r, 'talk track'), undefined, 'talk track is Demo-only');
 });
 
-test('--new turns the advisory rules 17 and 18 into failures', () => {
+test('--new turns the advisory rule 17 into a failure; the deferred rule 18 still only warns', () => {
   const d = tmp(); compliantTester(d);
   const r = audit(d, { strictNew: true });
-  assert.equal(rule(r, 'k8s').level, 'fail'); assert.equal(rule(r, 'MODE').level, 'fail'); assert.equal(rule(r, 'diagram-studio').level, 'fail');
-  put(d, 'k8s/deployment.yaml'); put(d, 'server/src/mode.js', 'export const m = process.env.MODE;'); put(d, 'web/src/d.js', "import 'diagram-studio'");
+  assert.equal(rule(r, 'diagram-studio').level, 'fail');
+  assert.equal(rule(r, 'k8s').level, 'warn', 'rule 18 is deferred (owner, 2026-10-31): never a failure');
+  assert.equal(rule(r, 'MODE').level, 'warn', 'rule 18 is deferred (owner, 2026-10-31): never a failure');
+  assert.equal(r.failed, 1);
+  put(d, 'web/src/d.js', "import 'diagram-studio'");
   assert.equal(audit(d, { strictNew: true }).failed, 0);
+  put(d, 'k8s/deployment.yaml'); put(d, 'server/src/mode.js', 'export const m = process.env.MODE;');
+  const ok = audit(d, { strictNew: true });
+  assert.equal(rule(ok, 'k8s').level, 'pass'); assert.equal(rule(ok, 'MODE').level, 'pass');
 });
 
 test('a Demo also needs talk track, presenter mode, customer.config, workspace id and cast tokens', () => {
