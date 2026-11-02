@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 export const LOCK = 'demo-kit.lock.json';
 const WORKFLOWS = '.github/workflows/';
 const MAX_OVERRIDE_DAYS = 30;
-const DEFAULT_REPO = 'git@github.com:cmuir_pingcorp/demo-kit-base.git';
+const DEFAULT_REPO = 'git@github.com:ping-sandbox/demo-kit-base.git';
 
 export const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 

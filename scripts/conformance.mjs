@@ -2,7 +2,7 @@
 // conformance: file-and-grep check of a demo repo against STANDALONE-RULES.md. Heuristic: a "fail" is a missing artifact, not a proof of
 // a bad app, and a "pass" is not a proof of a good one. Node only, no dependencies.
 //   node scripts/conformance.mjs [dir] [--tier=Demo|Tester|Tool] [--new] [--json]
-// Exit 1 when a required check fails. Checks marked advisory (rule 17) only fail with --new, so existing apps get warnings; rule 18 is deferred (owner, 2026-10-31) and always warns.
+// Exit 1 when a required check fails. Checks marked advisory (rules 17 and 19) only fail with --new, so existing apps get warnings; rule 18 is deferred (owner, 2026-10-31) and always warns.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,6 +77,10 @@ export function audit(root, { tier, strictNew = false } = {}) {
   add('safety', 'docker publishes 127.0.0.1 only', unsafePorts.length === 0, { tiers: 'A' });
   add('keygen', 'no EC generateKeyPair(Sync) (SIGABRT on Node 20)', !/generateKeyPair(Sync)?\(\s*['"]ec['"]/.test(allCode), { tiers: 'A' });
   add(17, 'diagrams from diagram-studio data', /diagram-studio/i.test(srcCode + pkgs), { tiers: 'DT', advisory: true });
+  // Rule 19 (owner, 2026-11-02): Mock, Real and a toggle that switches. Static evidence only: a POST/PUT .../mode route, /info reporting
+  // realAvailable, and a toggle in the UI. It does not start the app; a browser test is the proof. Advisory like rule 17.
+  add(19, 'Mock/Real switch: POST /mode route and /info realAvailable', /\.(post|put)\(\s*['"`]\/(api\/)?mode['"`]/.test(srcCode) && /realAvailable/.test(srcCode), { tiers: 'A', advisory: true });
+  add(19, 'Mock/Real toggle in the UI (ModeToggle or data-testid mode-real)', /data-testid=["']mode-real["']|\bModeToggle\b/.test(srcCode), { tiers: 'A', advisory: true });
   // Rule 18 (the SE mock-only build) is DEFERRED by the owner (2026-10-31, Docker only): it warns even with --new, so new apps are not forced to ship k8s manifests.
   add(18, 'k8s manifests (k8s/ or deploy/k8s)', has('k8s') || has('deploy/k8s'), { tiers: 'A', advisory: true, deferred: true });
   add(18, 'MODE switch for the mock-only build', /\b(process\.)?env\.(APP_|DEMO_|HOSTED_|MOCKAZ_|P1AZ_)?MODE\b/.test(srcCode), { tiers: 'A', advisory: true, deferred: true });

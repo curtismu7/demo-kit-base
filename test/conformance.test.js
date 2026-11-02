@@ -18,6 +18,7 @@ function compliantTester(root) {
   put(root, 'content-pack.json', '{}'); put(root, 'scripts/doctor.mjs'); put(root, 'scripts/reset.mjs');
   put(root, 'server/src/netguard.js'); put(root, 'server/src/health.js', "schema: 'demo-health/1'");
   put(root, 'package.json', '{"dependencies":{"@xyflow/react":"1"}}');
+  put(root, 'server/src/mode.js', "api.post('/mode', h); const info = { source, realAvailable };"); put(root, 'web/src/ModeToggle.jsx', 'export default function ModeToggle() {}');
   put(root, 'docker-compose.yml', 'services:\n  app:\n    ports:\n      - "127.0.0.1:4901:4901"\n');
 }
 const rule = (res, name) => res.rows.find((r) => r.name.includes(name));
@@ -111,4 +112,30 @@ test('main: exit 0 for a compliant app, 1 for failures, 2 for bad arguments; --j
   assert.equal(main([d, '--tier=Nope'], () => {}), 2);
   assert.equal(main([path.join(d, 'missing')], () => {}), 2);
   const j = []; main([d, '--json'], (l) => j.push(l)); assert.equal(JSON.parse(j.join('')).failed, 0);
+});
+
+test('rule 19: Mock/Real switch and toggle are advisory; they warn on an existing app and fail with --new', () => {
+  const d = tmp(); compliantTester(d);
+  fs.rmSync(path.join(d, 'server/src/mode.js')); fs.rmSync(path.join(d, 'web/src/ModeToggle.jsx'));
+  const r = audit(d);
+  assert.equal(rule(r, 'Mock/Real switch').level, 'warn'); assert.equal(rule(r, 'Mock/Real toggle').level, 'warn');
+  const strict = audit(d, { strictNew: true });
+  assert.equal(rule(strict, 'Mock/Real switch').level, 'fail'); assert.equal(rule(strict, 'Mock/Real toggle').level, 'fail');
+  put(d, 'server/src/mode.js', "api.post('/mode', h); const info = { source, realAvailable };");
+  assert.equal(rule(audit(d, { strictNew: true }), 'Mock/Real switch').level, 'pass');
+  assert.equal(rule(audit(d, { strictNew: true }), 'Mock/Real toggle').level, 'fail', 'a route alone is not a toggle');
+  put(d, 'web/src/ModeToggle.jsx', 'export default function ModeToggle() {}');
+  assert.equal(audit(d, { strictNew: true }).failed, 1, 'only rule 17 (diagram-studio) is left');
+});
+
+test('rule 19: a route that only reads /mode, or a /mode route with no realAvailable, is not a switch; test files do not count', () => {
+  const d = tmp(); compliantTester(d);
+  fs.rmSync(path.join(d, 'server/src/mode.js'));
+  put(d, 'server/src/mode.js', "app.get('/mode', h); const info = { source, realAvailable };");
+  assert.equal(rule(audit(d), 'Mock/Real switch').level, 'warn');
+  put(d, 'server/src/mode.js', "api.post('/mode', h);");
+  assert.equal(rule(audit(d), 'Mock/Real switch').level, 'warn');
+  fs.rmSync(path.join(d, 'server/src/mode.js'));
+  put(d, 'server/test/mode.test.js', "api.post('/mode', h); realAvailable");
+  assert.equal(rule(audit(d), 'Mock/Real switch').level, 'warn');
 });
