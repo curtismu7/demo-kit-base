@@ -81,6 +81,14 @@ export function audit(root, { tier, strictNew = false } = {}) {
   // realAvailable, and a toggle in the UI. It does not start the app; a browser test is the proof. Advisory like rule 17.
   add(19, 'Mock/Real switch: POST /mode route and /info realAvailable', /\.(post|put)\(\s*['"`]\/(api\/)?mode['"`]/.test(srcCode) && /realAvailable/.test(srcCode), { tiers: 'A', advisory: true });
   add(19, 'Mock/Real toggle in the UI (ModeToggle or data-testid mode-real)', /data-testid=["']mode-real["']|\bModeToggle\b/.test(srcCode), { tiers: 'A', advisory: true });
+  // Rule 20 (owner, 2026-11-03): shared Ping infrastructure. A standalone must NOT ship its own
+  // pingidentity/* container (PF, P1AZ, PingGateway, Privilege Gateway). Evidence of compliance:
+  // a pingProducts declaration in docs/shelf-entry.json, or any reference to ping-shared (probe/reuse).
+  // PingOne is SaaS and exempt. Advisory: the scan is static and the shared instance is a host property.
+  const composeFiles = rel.filter((r) => /compose.*\.ya?ml$|Dockerfile/i.test(r)).map(read).join('\n');
+  const shipsPingProduct = /pingidentity\/(pingfederate|pingauthorize|pinggateway|pd-repository)/i.test(composeFiles + allCode);
+  const declaresShared = /pingProducts|ping-shared/i.test(rel.filter((r) => /shelf-entry\.json$|\.md$|\.mjs$|\.js$/.test(r)).map(read).join('\n'));
+  add(20, 'shared Ping infra: no self-hosted pingidentity/* server container (rule 20)', !shipsPingProduct || declaresShared, { tiers: 'A', advisory: true });
   // Rule 18 (the SE mock-only build) is DEFERRED by the owner (2026-10-31, Docker only): it warns even with --new, so new apps are not forced to ship k8s manifests.
   add(18, 'k8s manifests (k8s/ or deploy/k8s)', has('k8s') || has('deploy/k8s'), { tiers: 'A', advisory: true, deferred: true });
   add(18, 'MODE switch for the mock-only build', /\b(process\.)?env\.(APP_|DEMO_|HOSTED_|MOCKAZ_|P1AZ_)?MODE\b/.test(srcCode), { tiers: 'A', advisory: true, deferred: true });
