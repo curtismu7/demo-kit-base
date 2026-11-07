@@ -10,7 +10,7 @@ const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'conf-')); m
 const put = (root, p, c = 'x') => { fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true }); fs.writeFileSync(path.join(root, p), c); };
 after(() => { for (const d of made) fs.rmSync(d, { recursive: true, force: true }); });
 
-const CI = 'jobs:\n  secrets:\n    steps:\n      - run: gitleaks detect\n      - name: forbidden strings (history)\n        run: echo\n';
+const CI = 'jobs:\n  secrets:\n    steps:\n      - run: gitleaks detect\n      - name: forbidden strings (history)\n        run: echo\n      - run: bash scripts/check-no-ai-attribution.sh\n';
 function compliantTester(root) {
   put(root, 'README.md', '# x\n\n**Tier: Tester**\n');
   put(root, 'CLAUDE.md'); put(root, '.github/workflows/ci.yml', CI);
@@ -138,4 +138,29 @@ test('rule 19: a route that only reads /mode, or a /mode route with no realAvail
   fs.rmSync(path.join(d, 'server/src/mode.js'));
   put(d, 'server/test/mode.test.js', "api.post('/mode', h); realAvailable");
   assert.equal(rule(audit(d), 'Mock/Real switch').level, 'warn');
+});
+
+// the credit text is assembled from pieces so this test file does not contain it (it would trip the very rule it tests)
+const credit = () => ['\u{1F916} Gener', 'ated with [Claude', ' Code](https://claude.com/claude-code)'].join('');
+const trailer = (who) => ['Co-Auth', 'ored-By: ', who].join('');
+
+test('no-AI-attribution rule: a credit in any file warns, fails with --new, passes once removed; human co-authors are fine', () => {
+  const d = tmp(); compliantTester(d);
+  assert.equal(rule(audit(d), 'no AI-attribution credit').level, 'pass');
+  put(d, 'docs/notes.md', 'text\n\n' + credit());
+  assert.equal(rule(audit(d), 'no AI-attribution credit').level, 'warn');
+  assert.equal(rule(audit(d, { strictNew: true }), 'no AI-attribution credit').level, 'fail');
+  assert.match(rule(audit(d), 'no AI-attribution credit').name, /docs\/notes\.md/);
+  put(d, 'docs/notes.md', 'clean');
+  put(d, 'docs/co.md', trailer('Claude <noreply@anthropic.com>'));
+  assert.equal(rule(audit(d), 'no AI-attribution credit').level, 'warn', 'an AI co-author trailer counts');
+  put(d, 'docs/co.md', trailer('Jane Doe <jane@example.com>'));
+  assert.equal(rule(audit(d), 'no AI-attribution credit').level, 'pass', 'a human co-author does not');
+});
+
+test('no-AI-attribution rule: CI must run scripts/check-no-ai-attribution.sh (warn, fail with --new)', () => {
+  const d = tmp(); compliantTester(d);
+  put(d, '.github/workflows/ci.yml', 'jobs:\n  secrets:\n    steps:\n      - run: gitleaks detect\n      - name: forbidden strings (history)\n        run: echo\n');
+  assert.equal(rule(audit(d), 'runs scripts/check-no-ai-attribution.sh').level, 'warn');
+  assert.equal(rule(audit(d, { strictNew: true }), 'runs scripts/check-no-ai-attribution.sh').level, 'fail');
 });

@@ -93,6 +93,14 @@ export function audit(root, { tier, strictNew = false } = {}) {
   add(18, 'k8s manifests (k8s/ or deploy/k8s)', has('k8s') || has('deploy/k8s'), { tiers: 'A', advisory: true, deferred: true });
   add(18, 'MODE switch for the mock-only build', /\b(process\.)?env\.(APP_|DEMO_|HOSTED_|MOCKAZ_|P1AZ_)?MODE\b/.test(srcCode), { tiers: 'A', advisory: true, deferred: true });
 
+  // No AI attribution anywhere (owner, 2026-11-07): no Claude Code "Generated with" line or AI Co-Authored-By trailer in any file, and CI runs
+  // scripts/check-no-ai-attribution.sh (tree + commits since the rule date). Advisory like rules 17/19 so existing apps warn; --new makes it fail.
+  // The pattern is bracketed so this file does not match its own check.
+  const CREDIT = /[G]enerated with \[?[C]laude Code|[C]o-[A]uthored-[B]y:[^\r\n]*(Claude|Anthropic|Copilot|GPT|Gemini|Codex|Cursor|opencode)/i;
+  const creditFiles = rel.filter((r) => r !== 'scripts/check-no-ai-attribution.sh' && !/package-lock|\.(png|jpe?g|gif|ico|woff2?|zip|pdf)$/i.test(r)).filter((r) => CREDIT.test(read(r)));
+  add('attribution', 'no AI-attribution credit in any file (owner rule 2026-11-07)' + (creditFiles.length ? ': ' + creditFiles.slice(0, 3).join(', ') : ''), creditFiles.length === 0, { tiers: 'A', advisory: true });
+  add('attribution', 'ci.yml runs scripts/check-no-ai-attribution.sh', /check-no-ai-attribution/.test(ci), { tiers: 'A', advisory: true });
+
   const applies = (c) => !t ? c.tiers === 'A' : c.tiers === 'A' || (c.tiers === 'D' && t === 'Demo') || (c.tiers === 'DT' && t !== 'Tool');
   const rows = C.filter(applies).map((c) => ({ ...c, level: c.ok ? 'pass' : (c.deferred || (c.advisory && !strictNew) ? 'warn' : 'fail') }));
   return { tier: t, rows, failed: rows.filter((r) => r.level === 'fail').length, warned: rows.filter((r) => r.level === 'warn').length };
