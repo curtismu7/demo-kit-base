@@ -5,6 +5,7 @@
 // Exit 1 when a required check fails. Checks marked advisory (rules 17 and 19) only fail with --new, so existing apps get warnings; rule 18 is deferred (owner, 2026-10-31) and always warns.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.data', 'e2e-output']);
@@ -100,6 +101,29 @@ export function audit(root, { tier, strictNew = false } = {}) {
   const creditFiles = rel.filter((r) => r !== 'scripts/check-no-ai-attribution.sh' && !/package-lock|\.(png|jpe?g|gif|ico|woff2?|zip|pdf)$/i.test(r)).filter((r) => CREDIT.test(read(r)));
   add('attribution', 'no AI-attribution credit in any file (owner rule 2026-11-07)' + (creditFiles.length ? ': ' + creditFiles.slice(0, 3).join(', ') : ''), creditFiles.length === 0, { tiers: 'A', advisory: true });
   add('attribution', 'ci.yml runs scripts/check-no-ai-attribution.sh', /check-no-ai-attribution/.test(ci), { tiers: 'A', advisory: true });
+
+  // Rule 22 (owner, 2026-11-12): the shared TopMenu is vendored byte-identical with a sha256 pin file that is
+  // actually verified. Static evidence: web/src/top-menu/{TopMenu.jsx,top-menu.css,top-menu.sha256} exist and the
+  // hashes in the pin match the files (a lab that hand-edited the copy fails). A repo test that reads the pin is
+  // the enforcement; here we check the pin's content matches.
+  const tmDir = path.join(root, 'web/src/top-menu');
+  let topMenuOk = false; let topMenuNote = '';
+  if (fs.existsSync(path.join(tmDir, 'TopMenu.jsx')) && fs.existsSync(path.join(tmDir, 'top-menu.css')) && fs.existsSync(path.join(tmDir, 'top-menu.sha256'))) {
+    try {
+      const pins = Object.fromEntries(read('web/src/top-menu/top-menu.sha256').split('\n').filter((l) => l.trim()).map((l) => { const [h, f] = l.trim().split(/\s+/); return [f, h]; }));
+      topMenuOk = ['TopMenu.jsx', 'top-menu.css'].every((f) => {
+        try { return execSync(`shasum -a 256 '${path.join(tmDir, f)}'`).toString().startsWith(pins[f] || '\u0000'); } catch { return false; }
+      });
+      if (!topMenuOk) topMenuNote = ' (pin hash mismatch: vendored copy edited, or re-vendored without regenerating the pin)';
+    } catch { topMenuNote = ' (could not verify the pin)'; }
+  } else topMenuNote = ' (missing web/src/top-menu/{TopMenu.jsx,top-menu.css,top-menu.sha256})';
+  add(22, 'shared TopMenu vendored with a matching sha256 pin (rule 22)' + topMenuNote, topMenuOk, { tiers: 'A', advisory: true });
+
+  // Rule 23 (owner, 2026-11-12): downstream failures are named, never blank. Static evidence: the server's upstream
+  // call path maps connection-refused/timeout/502-504 to a structured JSON error ({error, message}) — the app names
+  // these codes somewhere in non-test source. The proxy 502 down-page itself is shared infrastructure, checked in AI-DEMO-Standalone.
+  const errMapOk = /(ECONNREFUSED|ENOTFOUND|ETIMEDOUT|timeout|502|503|504)/i.test(srcCode) && /error/.test(srcCode);
+  add(23, 'upstream failures map to structured JSON errors, never blank (rule 23)', errMapOk, { tiers: 'A', advisory: true });
 
   const applies = (c) => !t ? c.tiers === 'A' : c.tiers === 'A' || (c.tiers === 'D' && t === 'Demo') || (c.tiers === 'DT' && t !== 'Tool');
   const rows = C.filter(applies).map((c) => ({ ...c, level: c.ok ? 'pass' : (c.deferred || (c.advisory && !strictNew) ? 'warn' : 'fail') }));
