@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { audit, detectTier, publishedPorts, main } from '../scripts/conformance.mjs';
 
 const made = [];
@@ -20,6 +21,11 @@ function compliantTester(root) {
   put(root, 'package.json', '{"dependencies":{"@xyflow/react":"1"}}');
   put(root, 'server/src/mode.js', "api.post('/mode', h); const info = { source, realAvailable };"); put(root, 'web/src/ModeToggle.jsx', 'export default function ModeToggle() {}');
   put(root, 'docker-compose.yml', 'services:\n  app:\n    ports:\n      - "127.0.0.1:4901:4901"\n');
+  // rule 22 (a vendored TopMenu with a matching pin) and rule 23 (upstream failures named): a compliant app has both
+  const sha = (c) => createHash('sha256').update(c).digest('hex');
+  put(root, 'web/src/top-menu/TopMenu.jsx', 'menu'); put(root, 'web/src/top-menu/top-menu.css', 'css');
+  put(root, 'web/src/top-menu/top-menu.sha256', `${sha('menu')}  TopMenu.jsx\n${sha('css')}  top-menu.css\n`);
+  put(root, 'server/src/upstream.js', "export const failed = (e) => (e.code === 'ECONNREFUSED' ? { error: 'upstream_down', message: 'unreachable' } : null);");
 }
 const rule = (res, name) => res.rows.find((r) => r.name.includes(name));
 
@@ -163,4 +169,27 @@ test('no-AI-attribution rule: CI must run scripts/check-no-ai-attribution.sh (wa
   put(d, '.github/workflows/ci.yml', 'jobs:\n  secrets:\n    steps:\n      - run: gitleaks detect\n      - name: forbidden strings (history)\n        run: echo\n');
   assert.equal(rule(audit(d), 'runs scripts/check-no-ai-attribution.sh').level, 'warn');
   assert.equal(rule(audit(d, { strictNew: true }), 'runs scripts/check-no-ai-attribution.sh').level, 'fail');
+});
+
+test('rule 25: a lab that calls a gateway needs the vendored GatewayTrace with a matching pin; one that does not is not asked', async () => {
+  const sha = (c) => createHash('sha256').update(c).digest('hex');
+  const d = tmp(); compliantTester(d);
+  assert.match(rule(audit(d), 'GatewayTrace').name, /not applicable/);
+  assert.equal(rule(audit(d), 'GatewayTrace').level, 'pass');
+  put(d, 'server/src/pep.js', "export const call = () => ({ method: 'tools/call' }); // Privilege door");
+  assert.equal(rule(audit(d), 'GatewayTrace').level, 'warn', 'a lab that says Privilege (not gateway) is still asked');
+  fs.rmSync(path.join(d, 'server/src/pep.js'));
+  put(d, 'server/src/gateway.js', "export const list = () => ({ method: 'tools/list' }); // the gateway");
+  assert.equal(rule(audit(d), 'GatewayTrace').level, 'warn');
+  assert.match(rule(audit(d), 'GatewayTrace').name, /missing/);
+  assert.equal(rule(audit(d, { strictNew: true }), 'GatewayTrace').level, 'fail');
+  const files = { 'web/src/gateway-trace/GatewayTrace.jsx': 'jsx', 'web/src/gateway-trace/gateway-trace.css': 'css', 'server/src/gatewayTrace.js': 'js' };
+  for (const [f, c] of Object.entries(files)) put(d, f, c);
+  const pin = `# pins\n${sha('jsx')}  GatewayTrace.jsx\n${sha('css')}  gateway-trace.css\n${sha('js')}  gatewayTrace.js\n`;
+  put(d, 'web/src/gateway-trace/gateway-trace.sha256', pin);
+  assert.equal(rule(audit(d), 'GatewayTrace').level, 'pass');
+  put(d, 'server/src/gatewayTrace.js', 'js edited');
+  assert.equal(rule(audit(d), 'GatewayTrace').level, 'warn');
+  assert.match(rule(audit(d), 'GatewayTrace').name, /gatewayTrace\.js/);
+  assert.equal(rule(audit(d, { strictNew: true }), 'GatewayTrace').level, 'fail');
 });

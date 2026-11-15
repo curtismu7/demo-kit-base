@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.data', 'e2e-output']);
@@ -124,6 +125,25 @@ export function audit(root, { tier, strictNew = false } = {}) {
   // these codes somewhere in non-test source. The proxy 502 down-page itself is shared infrastructure, checked in AI-DEMO-Standalone.
   const errMapOk = /(ECONNREFUSED|ENOTFOUND|ETIMEDOUT|timeout|502|503|504)/i.test(srcCode) && /error/.test(srcCode);
   add(23, 'upstream failures map to structured JSON errors, never blank (rule 23)', errMapOk, { tiers: 'A', advisory: true });
+
+  // Rule 25 (owner, 2026-11-15): a lab that calls a Privilege gateway (real, or its own simulation) shows each call through the shared
+  // GatewayTrace, vendored byte-identical with a sha256 pin that matches. Applies only when non-test source speaks MCP tools/list or tools/call and names a gateway, Privilege or an MCP door (a heuristic: a false positive is a warning, never a failure).
+  // Static evidence: web/src/gateway-trace/{GatewayTrace.jsx,gateway-trace.css,gateway-trace.sha256} and server/src/gatewayTrace.js exist,
+  // and the pin lists the hash of each (the server file under its plain name). The lab's own test is the enforcement.
+  const callsGateway = /tools\/(list|call)/.test(srcCode) && /gateway|privilege|PEP_URL|mcp door/i.test(srcCode);
+  let traceOk = !callsGateway; let traceNote = callsGateway ? '' : ' (no gateway call found: not applicable)';
+  if (callsGateway) {
+    const where = { 'GatewayTrace.jsx': 'web/src/gateway-trace/GatewayTrace.jsx', 'gateway-trace.css': 'web/src/gateway-trace/gateway-trace.css', 'gatewayTrace.js': 'server/src/gatewayTrace.js' };
+    const missing = [...Object.values(where), 'web/src/gateway-trace/gateway-trace.sha256'].filter((f) => !has(f));
+    if (missing.length) traceNote = ` (missing ${missing.join(', ')})`;
+    else {
+      const pins = Object.fromEntries(read('web/src/gateway-trace/gateway-trace.sha256').split('\n').filter((l) => l.trim() && !l.startsWith('#')).map((l) => { const [h, f] = l.trim().split(/\s+/); return [f, h]; }));
+      const bad = Object.entries(where).filter(([f, rp]) => createHash('sha256').update(fs.readFileSync(abs(rp))).digest('hex') !== pins[f]).map(([f]) => f);
+      traceOk = bad.length === 0;
+      if (!traceOk) traceNote = ` (pin hash mismatch: ${bad.join(', ')} edited, or re-vendored without regenerating the pin)`;
+    }
+  }
+  add(25, 'shared GatewayTrace vendored with a matching sha256 pin (rule 25)' + traceNote, traceOk, { tiers: 'A', advisory: true });
 
   const applies = (c) => !t ? c.tiers === 'A' : c.tiers === 'A' || (c.tiers === 'D' && t === 'Demo') || (c.tiers === 'DT' && t !== 'Tool');
   const rows = C.filter(applies).map((c) => ({ ...c, level: c.ok ? 'pass' : (c.deferred || (c.advisory && !strictNew) ? 'warn' : 'fail') }));
